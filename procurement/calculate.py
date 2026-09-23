@@ -12,6 +12,9 @@ import pandas as pd
 from .ingest import SupplierData
 
 
+MODEL_VERSION = 'regular-demand-v2'
+
+
 @dataclass(frozen=True)
 class Settings:
     lead_days: int = 30
@@ -95,15 +98,18 @@ def _stockout_adjustments(monthly: pd.DataFrame, stockouts: pd.DataFrame) -> pd.
 
 
 def _seasonal_factors(monthly: pd.DataFrame) -> dict[str, dict[int, float]]:
-    """SKU factors shrink toward the supplier pattern when SKU evidence is scarce."""
-    full = monthly[monthly.month.map(lambda d: d.year in (2024, 2025))].copy()
+    """Use the latest two complete historical years, with supplier shrinkage."""
+    periods = monthly['month'].drop_duplicates()
+    by_year = periods.groupby(periods.map(lambda d: d.year))
+    years = sorted(year for year, values in by_year if {d.month for d in values} == set(range(1, 13)))[-2:]
+    full = monthly[monthly.month.map(lambda d: d.year in years)].copy()
     if full.empty:
         return {}
     totals = full.groupby('month')['qty'].sum()
     supplier_factors = {}
     for month in range(1, 13):
         ratios = []
-        for year in (2024, 2025):
+        for year in years:
             year_values = [float(totals.get(date(year, m, 1), 0)) for m in range(1, 13)]
             mean = sum(year_values) / 12
             if mean > 0:
@@ -159,11 +165,29 @@ def _forecast(code: str, monthly: pd.DataFrame, as_of: date, settings: Settings,
 
 
 def recommend(data: SupplierData, settings: Settings, stockouts: pd.DataFrame | None = None,
-              balances: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Recommend quantities; never silently substitute missing balances with zero."""
-    monthly = data.monthly.copy()
-    excess = _outlier_excess(data.events)
-    lost = _stockout_adjustments(monthly, stockouts)
+              balances: pd.DataFrame | None = None, *, forecast_start: date | None = None) -> pd.DataFrame:
+    """Recommend demand for a fixed [start, end) interval using only earlier data.
+
+    Explicit forecast starts allow saved forecasts to begin after the last known
+    operation. Omitting the argument retains the legacy calculation date.
+    """
+    start = forecast_start if forecast_start is not None else data.as_of
+    # A later planning date cannot turn an old export's partial month into a
+    # fully observed month. A last operation on month-end does close that month.
+    known_until = min(start, data.as_of + timedelta(days=1))
+    monthly = data.monthly[data.monthly.month < _month_start(known_until)].copy()
+    events = data.events[data.events.date < known_until] if not data.events.empty else data.events
+    excess = _outlier_excess(events)
+    prior_stockouts = stockouts
+    if stockouts is not None and not stockouts.empty:
+        prior_stockouts = stockouts.copy()
+        for field in ('start', 'end'):
+            prior_stockouts[field] = pd.to_datetime(prior_stockouts[field], errors='raise').dt.date
+        if (prior_stockouts.end < prior_stockouts.start).any():
+            raise ValueError('Некорректный период stockout: конец раньше начала')
+        prior_stockouts = prior_stockouts[prior_stockouts.start < known_until].copy()
+        prior_stockouts['end'] = prior_stockouts.end.map(lambda day: min(day, known_until - timedelta(days=1)))
+    lost = _stockout_adjustments(monthly, prior_stockouts)
     monthly = monthly.merge(excess, how='left', on=['code', 'month']).merge(lost, how='left', on=['code', 'month'])
     monthly['excess'] = pd.to_numeric(monthly['excess'], errors='coerce').fillna(0.0)
     monthly['lost'] = pd.to_numeric(monthly['lost'], errors='coerce').fillna(0.0)
@@ -174,7 +198,7 @@ def recommend(data: SupplierData, settings: Settings, stockouts: pd.DataFrame | 
     balance_overrides = {}
     if balances is not None and not balances.empty:
         balance_overrides = dict(zip(balances.code.map(str), balances.balance))
-    end = data.as_of + timedelta(days=settings.lead_days + settings.review_days)
+    end = start + timedelta(days=settings.lead_days + settings.review_days)
     lines = []
     for product in data.catalog.itertuples(index=False):
         code = product.code
@@ -184,9 +208,14 @@ def recommend(data: SupplierData, settings: Settings, stockouts: pd.DataFrame | 
         item_history = monthly_by_code.get(code)
         if item_history is None:
             continue
-        forecast, daily, trend = _forecast(code, item_history, data.as_of, settings, factors)
+        forecast, daily, trend = _forecast(code, item_history, start, settings, factors)
         incoming = incoming_by_code.get(code)
-        on_time = incoming[(incoming.eta > data.as_of) & (incoming.eta <= end)].qty.sum() if incoming is not None else 0.0
+        on_time = 0.0
+        if incoming is not None:
+            if forecast_start is None:
+                on_time = incoming[(incoming.eta > start) & (incoming.eta <= end)].qty.sum()
+            else:
+                on_time = incoming[(incoming.eta >= start) & (incoming.eta < end)].qty.sum()
         safety = daily * settings.safety_days
         raw = max(0, forecast + safety - float(balance) - float(on_time))
         pack = product.pack if product.pack is not None and not pd.isna(product.pack) and product.pack > 0 else 1
@@ -206,6 +235,7 @@ def recommend(data: SupplierData, settings: Settings, stockouts: pd.DataFrame | 
         lines.append(dict(Поставщик=data.name, **{'Код 1С':code, 'Артикул':product.article,
             'Наименование':product.name, 'Категория':product.category, 'Рекомендовано':recommended,
             'Срочность':risk, 'Прогноз':round(forecast, 1), 'Резерв':round(safety, 1),
+            'Начало прогноза':start.isoformat(), 'Конец прогноза':end.isoformat(),
             'Остаток':round(float(balance), 1), 'В пути вовремя':round(float(on_time), 1),
             'В пути без даты':round(float(product.pending), 1), 'Кратность':int(pack),
             'Тренд':round(trend * 100, 1), 'Исключено выбросов':round(anomaly, 1),

@@ -49,9 +49,16 @@ def icon(name, size=24):
             f'stroke-linejoin="round" aria-hidden="true">{paths[name]}</svg>')
 
 
-def render_brand():
+def render_brand(page_name='План закупок'):
     st.html(f'<style>{brand_css()}</style>')
     logo = b64encode((ASSETS / 'ekt-logo.svg').read_bytes()).decode('ascii')
+    is_bi = page_name == 'BI-аналитика'
+    title = 'BI-аналитика' if is_bi else 'План закупок'
+    subtitle = ('Продажи, история расчётов и проверка точности прогнозов.' if is_bi else
+                'От истории продаж — к обоснованному заказу поставщику.')
+    navigation = (f'<a class="ekt-nav-active" href="#purchase-plan">{icon("chart", 19)} Аналитика закупок</a>' if is_bi else
+                  f'<a class="ekt-nav-active" href="#purchase-plan">{icon("box", 19)} Заказы поставщикам</a>'
+                  '<a href="#input-data">Данные и параметры</a><a href="#methodology">Как рассчитываем</a>')
     brand_html(f'''
     <div class="ekt-topbar">
       <span>Группа компаний «Электрокомплект»</span>
@@ -65,14 +72,12 @@ def render_brand():
       <a class="ekt-site-link" href="https://ekt.kz/" target="_blank" rel="noopener noreferrer">На сайт компании ↗</a>
     </header>
     <nav class="ekt-nav" aria-label="Разделы страницы">
-      <a class="ekt-nav-active" href="#purchase-plan">{icon('box', 19)} Заказы поставщикам</a>
-      <a href="#input-data">Данные и параметры</a>
-      <a href="#methodology">Как рассчитываем</a>
+      {navigation}
     </nav>
     <div class="ekt-page-heading" id="purchase-plan">
       <div class="ekt-breadcrumb">Рабочее пространство <span>/</span> Закупки</div>
-      <div class="ekt-heading-row"><div><h1>План закупок</h1>
-      <p>От истории продаж — к обоснованному заказу поставщику.</p></div>
+      <div class="ekt-heading-row"><div><h1>{title}</h1>
+      <p>{subtitle}</p></div>
       <span class="ekt-local-status"><i></i> Данные на вашем компьютере</span></div>
     </div>
     ''')
